@@ -1,0 +1,28 @@
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+/dist/
+/bin/
+
+# Local dependencies
+/.deps/
+/spidermonkey/
+
+# Local configuration and runtime state
+.env
+/auth/
+/runtime/
+/data/
+*.log
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

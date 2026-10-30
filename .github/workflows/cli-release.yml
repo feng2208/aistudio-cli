@@ -1,0 +1,99 @@
+name: Build And Release CLI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  GOTOOLCHAIN: local
+  SPIDERMONKEY: v152.0.4-aistudio2api.1
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: ./.github/actions/spidermonkey
+        with:
+          target: linux-amd64-gnu
+      - name: Run Tests
+        run: go test -mod=readonly -trimpath -vet=off ./...
+      - name: Run Vet
+        run: go vet -mod=readonly -trimpath ./...
+
+  build-windows:
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install LLVM-MinGW
+        run: |
+          curl -fsSL https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/spidermonkey
+        with:
+          target: windows-amd64
+      - name: Build CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_SHA:0:7}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          version="${version//\//-}"
+          mkdir -p dist
+          CC=x86_64-w64-mingw32-clang \
+          CXX=x86_64-w64-mingw32-clang++ \
+          GOOS=windows GOARCH=amd64 \
+            go build -mod=readonly -trimpath -ldflags="-s -w" -o dist/aistudio-cli.exe ./cmd/aistudio-cli
+          (cd dist && zip -q "aistudio-cli-${version}-windows-amd64.zip" aistudio-cli.exe)
+          ls -lh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-windows-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [test, build-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-windows-amd64
+          path: dist
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG" "${flags[@]}"

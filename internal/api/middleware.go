@@ -1,0 +1,539 @@
+package api
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"net"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"aistudio-cli/internal/aistudio"
+)
+
+type accessLogContextKey struct{}
+
+type accessLogMetadata struct {
+	mu              sync.Mutex
+	admin           AdminService
+	method          string
+	path            string
+	started         bool
+	generation      bool
+	model           string
+	account         string
+	channel         string
+	finishReason    string
+	err             string
+	canceled        bool
+	detached        bool
+	failureStatus   int
+	firstEvent      time.Duration
+	upstreamBytes   int64
+	usage           *aistudio.Usage
+	toolCalls       int
+	inputMessages   int
+	inputTextChars  int
+	inputMedia      int
+	inputMediaBytes int64
+	inputFiles      int
+	temperature     string
+	topP            string
+	thinking        string
+	maxOutputTokens string
+	requestID       string
+	startedAt       time.Time
+	queueWait       time.Duration
+	proof           time.Duration
+	attempts        []RequestAttempt
+	authorized      bool
+}
+
+type accessLogResponseWriter struct {
+	http.ResponseWriter
+	status   int
+	metadata *accessLogMetadata
+}
+
+func (writer *accessLogResponseWriter) WriteHeader(status int) {
+	if writer.status != 0 {
+		return
+	}
+	writer.status = status
+	writer.ResponseWriter.WriteHeader(status)
+}
+
+func (writer *accessLogResponseWriter) Write(data []byte) (int, error) {
+	if writer.status == 0 {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return writer.ResponseWriter.Write(data)
+}
+
+// FlushError 记录状态并向响应控制器返回底层刷新错误
+func (writer *accessLogResponseWriter) FlushError() error {
+	if writer.status == 0 {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(writer.ResponseWriter).Flush()
+}
+
+func (writer *accessLogResponseWriter) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
+}
+
+func (writer *accessLogResponseWriter) setError(message string) {
+	if message = strings.TrimSpace(message); message != "" {
+		writer.metadata.mu.Lock()
+		writer.metadata.err = message
+		writer.metadata.mu.Unlock()
+	}
+}
+
+func (metadata *accessLogMetadata) start(force bool) {
+	metadata.mu.Lock()
+	if metadata.started || !force && metadata.account == "" {
+		metadata.mu.Unlock()
+		return
+	}
+	metadata.started = true
+	admin := metadata.admin
+	entry := AccessLog{
+		Method: metadata.method, Path: metadata.path, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
+		Temperature: metadata.temperature, TopP: metadata.topP, Thinking: metadata.thinking,
+		MaxOutputTokens: metadata.maxOutputTokens, Generation: metadata.generation, RequestID: metadata.requestID,
+		InputMessages: metadata.inputMessages, InputTextChars: metadata.inputTextChars,
+		InputMedia: metadata.inputMedia, InputMediaBytes: metadata.inputMediaBytes, InputFiles: metadata.inputFiles,
+	}
+	metadata.mu.Unlock()
+	if admin != nil {
+		admin.RecordAccessStart(entry)
+	}
+}
+
+// finished 返回请求结束时的访问日志，status 为写出的 HTTP 状态，disconnected 表示客户端连接已关闭
+func (metadata *accessLogMetadata) finished(status int, disconnected bool) AccessLog {
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	if metadata.canceled || !metadata.detached && disconnected {
+		status = 499
+	} else if status < http.StatusBadRequest && metadata.failureStatus >= http.StatusBadRequest {
+		status = metadata.failureStatus
+	}
+	return AccessLog{
+		Status: status, FirstEvent: metadata.firstEvent, QueueWait: metadata.queueWait, Proof: metadata.proof,
+		UpstreamBytes: metadata.upstreamBytes, Usage: metadata.usage, ToolCalls: metadata.toolCalls,
+		InputMessages: metadata.inputMessages, InputTextChars: metadata.inputTextChars,
+		InputMedia: metadata.inputMedia, InputMediaBytes: metadata.inputMediaBytes, InputFiles: metadata.inputFiles,
+		Temperature: metadata.temperature, TopP: metadata.topP, Thinking: metadata.thinking, MaxOutputTokens: metadata.maxOutputTokens,
+		RequestID: metadata.requestID, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
+		FinishReason: metadata.finishReason, Error: metadata.err, Canceled: metadata.canceled, Generation: metadata.generation,
+		Attempts: slices.Clone(metadata.attempts), Authorized: metadata.authorized,
+	}
+}
+
+// id 返回请求日志使用的请求 ID
+func (metadata *accessLogMetadata) id() string {
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	return metadata.requestID
+}
+
+// MarkAccessLogScheduled 记录请求从进入服务到取得本次执行账户的排队时间
+func MarkAccessLogScheduled(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		if !metadata.startedAt.IsZero() {
+			metadata.queueWait = time.Since(metadata.startedAt)
+		}
+		metadata.mu.Unlock()
+	}
+}
+
+// DetachAccessLog 标记请求的生成不随客户端连接关闭而结束，访问日志的状态按生成结果记录
+func DetachAccessLog(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.detached = true
+		metadata.mu.Unlock()
+	}
+}
+
+// markAccessLogAuthorized 标记请求已通过公开 API key 校验
+func markAccessLogAuthorized(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.authorized = true
+		metadata.mu.Unlock()
+	}
+}
+
+// AddAccessLogAttempt 追加一次未成功的上游尝试
+func AddAccessLogAttempt(ctx context.Context, attempt RequestAttempt) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.attempts = append(metadata.attempts, attempt)
+		metadata.mu.Unlock()
+	}
+}
+
+// AddAccessLogProof 累计请求等待并生成 WAA proof 的时间
+func AddAccessLogProof(ctx context.Context, duration time.Duration) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.proof += duration
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogFirstEvent 写入首个上游语义事件耗时
+func SetAccessLogFirstEvent(ctx context.Context, firstEvent time.Duration) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		if metadata.firstEvent == 0 {
+			metadata.firstEvent = firstEvent
+		}
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogGenerationConfig 写入生成请求采用的参数
+func SetAccessLogGenerationConfig(ctx context.Context, config aistudio.GenerationConfig) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.generation = true
+		metadata.temperature = formatLogFloat(config.Temperature)
+		metadata.topP = formatLogFloat(config.TopP)
+		metadata.thinking = formatLogThinking(config)
+		metadata.maxOutputTokens = formatLogInt(config.MaxOutputTokens)
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogGenerationInput 写入生成请求输入摘要
+func SetAccessLogGenerationInput(ctx context.Context, request aistudio.GenerateRequest) {
+	metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata)
+	if !ok {
+		return
+	}
+	textChars := utf8.RuneCountInString(aistudio.SystemText(request.System))
+	media := 0
+	var mediaBytes int64
+	files := 0
+	for _, content := range request.Contents {
+		for _, part := range content.Parts {
+			textChars += utf8.RuneCountInString(part.Text)
+			if part.InlineData != nil {
+				media++
+				mediaBytes += int64(len(part.InlineData.Data))
+			}
+			if part.ExternalMedia != nil {
+				media++
+			}
+			if part.File != nil {
+				files++
+			}
+		}
+	}
+	metadata.mu.Lock()
+	metadata.requestID = strings.TrimSpace(request.ID)
+	metadata.inputMessages = len(request.Contents)
+	metadata.inputTextChars = textChars
+	metadata.inputMedia = media
+	metadata.inputMediaBytes = mediaBytes
+	metadata.inputFiles = files
+	metadata.mu.Unlock()
+}
+
+// SetAccessLogUpstreamBytes 写入上游响应体字节数
+func SetAccessLogUpstreamBytes(ctx context.Context, bytes int64) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.upstreamBytes = bytes
+		metadata.mu.Unlock()
+	}
+}
+
+// StartAccessLog 立即写入已经完成解析的请求开始记录
+func StartAccessLog(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.start(true)
+	}
+}
+
+func formatLogFloat(value *float64) string {
+	if value == nil {
+		return "默认"
+	}
+	return strconv.FormatFloat(*value, 'f', -1, 64)
+}
+
+func formatLogInt(value *int64) string {
+	if value == nil {
+		return "默认"
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+func formatLogThinking(config aistudio.GenerationConfig) string {
+	if effort := strings.TrimSpace(config.ReasoningEffort); effort != "" {
+		return effort
+	}
+	if config.ThinkingBudget != nil {
+		return "预算" + strconv.FormatInt(*config.ThinkingBudget, 10)
+	}
+	return "默认"
+}
+
+// SetAccessLogTarget 写入请求实际使用的模型与账户
+func SetAccessLogTarget(ctx context.Context, model string, account string) {
+	metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata)
+	if !ok {
+		return
+	}
+	metadata.mu.Lock()
+	if model = strings.TrimSpace(model); model != "" {
+		metadata.model = strings.TrimPrefix(model, "models/")
+	}
+	if account = strings.TrimSpace(account); account != "" {
+		metadata.account = account
+	}
+	metadata.mu.Unlock()
+	metadata.start(false)
+}
+
+// SetAccessLogChannel 写入请求实际使用的上游通道
+func SetAccessLogChannel(ctx context.Context, channel string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.channel = strings.TrimSpace(channel)
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogError 写入请求最终错误
+func SetAccessLogError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.err = strings.TrimSpace(err.Error())
+		metadata.canceled = errors.Is(err, context.Canceled)
+		if metadata.canceled {
+			metadata.failureStatus = 499
+		} else {
+			metadata.failureStatus = statusFromError(err)
+		}
+		metadata.mu.Unlock()
+	}
+}
+
+// setAccessLogFailureStatus 记录响应头以 200 提交后才确定的失败状态
+func setAccessLogFailureStatus(ctx context.Context, status int) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok && status >= http.StatusBadRequest {
+		metadata.mu.Lock()
+		metadata.failureStatus = status
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogFinishReason 写入生成请求的上游终止原因
+func SetAccessLogFinishReason(ctx context.Context, reason string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.finishReason = strings.TrimSpace(reason)
+		metadata.mu.Unlock()
+	}
+}
+
+// SetAccessLogGenerationResult 写入生成流的完成摘要
+func SetAccessLogGenerationResult(ctx context.Context, usage *aistudio.Usage, toolCalls int) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		if usage != nil {
+			value := *usage
+			metadata.usage = &value
+		}
+		metadata.toolCalls = toolCalls
+		metadata.mu.Unlock()
+	}
+}
+
+func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: r.URL.Path, requestID: newID("req"), startedAt: started}
+		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}
+		request := r.WithContext(context.WithValue(r.Context(), accessLogContextKey{}, metadata))
+		next.ServeHTTP(writer, request)
+		if admin == nil {
+			return
+		}
+		status := writer.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		entry := metadata.finished(status, errors.Is(r.Context().Err(), context.Canceled))
+		entry.Latency, entry.Method, entry.Path = time.Since(started), r.Method, r.URL.Path
+		admin.RecordAccessLog(entry)
+	})
+}
+
+func setAccessLogResponseError(w http.ResponseWriter, message string) {
+	if writer, ok := w.(interface{ setError(string) }); ok {
+		writer.setError(message)
+	}
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "*")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Headers", r.Header.Get("Access-Control-Request-Headers"))
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func loopbackMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil || !net.ParseIP(host).IsLoopback() || !loopbackHost(r.Host) {
+			writeAdminError(w, http.StatusForbidden, "control_plane_forbidden", "Control plane is only available from loopback")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loopbackHost 判断 Host 或 Origin 主机名是否为 localhost 或回环地址
+func loopbackHost(host string) bool {
+	name := host
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		name = hostname
+	}
+	name = strings.Trim(name, "[]")
+	if strings.EqualFold(name, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
+}
+
+// browserOriginMiddleware 在未配置 API key 时拒绝外部网页与 null 来源的浏览器请求
+func browserOriginMiddleware(requiredKey string, next http.Handler) http.Handler {
+	if strings.TrimSpace(requiredKey) != "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originValue := strings.TrimSpace(r.Header.Get("Origin"))
+		if originValue == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin, err := url.Parse(originValue)
+		webOrigin := err != nil || originValue == "null" || origin.Scheme == "http" || origin.Scheme == "https"
+		if webOrigin && (err != nil || !loopbackHost(origin.Host)) {
+			writeAuthError(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// maxPublicBodyBytes 为公开接口请求体上限，可容纳 Base64 编码后的最大文件
+const maxPublicBodyBytes = openAIFileMaxBytes/3*4 + openAIFileRequestOverhead
+
+// bodyLimitMiddleware 限制公开接口请求体大小
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxPublicBodyBytes)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func sameOriginMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			writeAdminError(w, http.StatusForbidden, "control_plane_origin_forbidden", "Control plane requires a same-origin browser request")
+			return
+		}
+		originValue := strings.TrimSpace(r.Header.Get("Origin"))
+		if originValue == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin, err := url.Parse(originValue)
+		if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.User != nil || origin.Host == "" || !strings.EqualFold(origin.Host, r.Host) {
+			writeAdminError(w, http.StatusForbidden, "control_plane_origin_forbidden", "Control plane requires a same-origin browser request")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authMiddleware(configuredKeys string, next http.Handler) http.Handler {
+	var keys []string
+	for key := range strings.SplitSeq(configuredKeys, ",") {
+		if key = strings.TrimSpace(key); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(keys) > 0 && !checkAPIKeyMatches(r, keys) {
+			writeAuthError(w, r)
+			return
+		}
+		markAccessLogAuthorized(r.Context())
+		next.ServeHTTP(w, r)
+	})
+}
+
+// apiKeyCandidates 返回请求头与 URL 中给出的 API key，去掉首尾空白
+func apiKeyCandidates(r *http.Request) []string {
+	candidates := []string{
+		r.Header.Get("X-Goog-API-Key"),
+		r.Header.Get("X-API-Key"),
+		bearerToken(r.Header.Get("Authorization")),
+		r.URL.Query().Get("key"),
+	}
+	for index, candidate := range candidates {
+		candidates[index] = strings.TrimSpace(candidate)
+	}
+	return candidates
+}
+
+// checkAPIKeyMatches 判断请求头或 URL 中任一 API key 是否与配置的某个 key 相同
+func checkAPIKeyMatches(r *http.Request, keys []string) bool {
+	for _, cand := range apiKeyCandidates(r) {
+		if cand == "" {
+			continue
+		}
+		for _, key := range keys {
+			if subtle.ConstantTimeCompare([]byte(cand), []byte(key)) == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bearerToken 返回 Authorization Bearer 凭据
+func bearerToken(authorization string) string {
+	scheme, key, ok := strings.Cut(strings.TrimSpace(authorization), " ")
+	if ok && strings.EqualFold(scheme, "Bearer") {
+		return strings.TrimSpace(key)
+	}
+	return ""
+}

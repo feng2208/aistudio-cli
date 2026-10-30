@@ -1,0 +1,490 @@
+package api
+
+import (
+	"cmp"
+	"encoding/base64"
+	"fmt"
+	"maps"
+	"mime"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"aistudio-cli/internal/aistudio"
+)
+
+// interactionMedia 投影音频容器、采样参数及其他媒体内容
+func interactionMedia(media aistudio.Blob, audioFormat string) (map[string]any, error) {
+	baseType, parameters, err := mime.ParseMediaType(media.MIME)
+	if err != nil {
+		return nil, err
+	}
+	if baseType == "audio/wav" || baseType == "audio/x-wav" {
+		media, err = wavPCM(media)
+		if err != nil {
+			return nil, err
+		}
+		baseType, parameters, _ = mime.ParseMediaType(media.MIME)
+	}
+	typeName := interactionContentType(baseType)
+	content := map[string]any{"type": typeName, "mime_type": baseType}
+	data := media.Data
+	if typeName == "audio" {
+		data, _, err = encodeSpeechResponse(media, audioFormat)
+		if err != nil {
+			return nil, err
+		}
+		if audioFormat == "wav" {
+			content["mime_type"] = "audio/wav"
+		}
+		if rate, parseErr := strconv.Atoi(parameters["rate"]); parseErr == nil {
+			content["sample_rate"] = rate
+		}
+		channels := 1
+		if value, parseErr := strconv.Atoi(parameters["channels"]); parseErr == nil {
+			channels = value
+		}
+		content["channels"] = channels
+	}
+	content["data"] = base64.StdEncoding.EncodeToString(data)
+	return content, nil
+}
+
+// interactionContentType 返回 MIME 类型对应的 Interactions 内容类型，音频、视频与图片之外为 document
+func interactionContentType(mimeType string) string {
+	typeName, _, _ := strings.Cut(mimeType, "/")
+	if typeName != "audio" && typeName != "video" && typeName != "image" {
+		return "document"
+	}
+	return typeName
+}
+
+// interactionStep 将单个规范事件投影为步骤内容与对应增量
+func interactionStep(event aistudio.Event, audio outputAudioFormat) (map[string]any, map[string]any, error) {
+	var content map[string]any
+	switch event.Kind {
+	case aistudio.EventText:
+		content = map[string]any{"type": "text", "text": event.Text}
+		if words := interactionWordInfos(event.Transcript, event.Text, 0); len(words) > 0 {
+			content["annotations"] = words
+		}
+	case aistudio.EventReasoning:
+		content = map[string]any{"type": "text", "text": event.Text}
+		if event.InlineData != nil {
+			var err error
+			if content, err = interactionMedia(*event.InlineData, audio.container()); err != nil {
+				return nil, nil, err
+			}
+		}
+		step := map[string]any{"type": "thought", "summary": []map[string]any{content}}
+		if event.ThoughtSignature != "" {
+			step["signature"] = event.ThoughtSignature
+		}
+		return step, map[string]any{"type": "thought_summary", "content": content}, nil
+	case aistudio.EventThoughtSignature:
+		return map[string]any{"type": "thought", "signature": event.ThoughtSignature}, map[string]any{"type": "thought_signature", "signature": event.ThoughtSignature}, nil
+	case aistudio.EventToolCall:
+		call := event.FunctionCall
+		return map[string]any{"type": "function_call", "id": call.ID, "name": call.Name, "arguments": call.Arguments}, nil, nil
+	case aistudio.EventServerToolCall, aistudio.EventServerToolResponse, aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
+		step, err := interactionToolStep(event.Part)
+		if err != nil || step == nil {
+			return nil, nil, err
+		}
+		delta := maps.Clone(step)
+		delete(delta, "id")
+		delete(delta, "call_id")
+		delete(delta, "search_type")
+		if event.ThoughtSignature != "" {
+			step["signature"], delta["signature"] = event.ThoughtSignature, event.ThoughtSignature
+		}
+		return step, delta, nil
+	case aistudio.EventMedia:
+		if external := event.ExternalMedia; external != nil {
+			content = map[string]any{"type": interactionContentType(external.MIME), "mime_type": external.MIME, "uri": external.URL}
+			break
+		}
+		media := *event.InlineData
+		var err error
+		if strings.HasPrefix(media.MIME, "audio/") {
+			if media, err = audio.encode(media); err != nil {
+				return nil, nil, err
+			}
+		}
+		content, err = interactionMedia(media, audio.container())
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if content == nil {
+		return nil, nil, nil
+	}
+	return map[string]any{"type": "model_output", "content": []map[string]any{content}}, content, nil
+}
+
+// interactionWordInfos 把转录逐词时间投影为 word_info 注释，下标为词在 text 中的字节位置加 offset
+func interactionWordInfos(transcript *aistudio.TranscriptMetadata, text string, offset int) []map[string]any {
+	if transcript == nil {
+		return nil
+	}
+	annotations := make([]map[string]any, 0, len(transcript.Words))
+	cursor := 0
+	for _, word := range transcript.Words {
+		annotation := map[string]any{"type": "word_info", "text": word.Word, "start_offset": geminiDuration(word.Start), "end_offset": geminiDuration(word.End)}
+		if transcript.Speaker != "" {
+			annotation["speaker"] = transcript.Speaker
+		}
+		if position := strings.Index(text[cursor:], word.Word); word.Word != "" && position >= 0 {
+			cursor += position
+			annotation["start_index"], annotation["end_index"] = offset+cursor, offset+cursor+len(word.Word)
+			cursor += len(word.Word)
+		}
+		annotations = append(annotations, annotation)
+	}
+	return annotations
+}
+
+// shiftWordInfos 把 word_info 注释的下标移动 offset 字节
+func shiftWordInfos(annotations []map[string]any, offset int) []map[string]any {
+	shifted := make([]map[string]any, 0, len(annotations))
+	for _, annotation := range annotations {
+		annotation = maps.Clone(annotation)
+		for _, key := range []string{"start_index", "end_index"} {
+			if index, ok := annotation[key].(int); ok {
+				annotation[key] = index + offset
+			}
+		}
+		shifted = append(shifted, annotation)
+	}
+	return shifted
+}
+
+// interactionText 表示一段 text 内容及其文字在上游全文中的位置
+type interactionText struct {
+	content map[string]any
+	spans   []textSpan
+}
+
+// interactionCitations 返回引用事件与 grounding 事件携带的引用
+func interactionCitations(event aistudio.Event) []aistudio.Citation {
+	switch event.Kind {
+	case aistudio.EventCitation:
+		return []aistudio.Citation{*event.Citation}
+	case aistudio.EventGrounding:
+		return groundingCitations(*event.Grounding)
+	}
+	return nil
+}
+
+// interactionAnnotation 返回 url_citation 注释：有区间的引用把上游全文字节区间换算为该段文本中的字节下标，区间不在该段文本内时返回 false
+func interactionAnnotation(citation aistudio.Citation, spans []textSpan) (map[string]any, bool) {
+	annotation := map[string]any{"type": "url_citation", "url": citation.URL}
+	if citation.Title != "" {
+		annotation["title"] = citation.Title
+	}
+	if citation.End == 0 {
+		return annotation, true
+	}
+	for _, span := range spans {
+		start, end := citation.Start-span.source, citation.End-span.source
+		if start >= 0 && start <= end && end <= span.length {
+			annotation["start_index"], annotation["end_index"] = span.output+start, span.output+end
+			return annotation, true
+		}
+	}
+	return nil, false
+}
+
+// appendTextSpan 追加正文区间，与上一区间在原文与输出中都相接时合并为一段
+func appendTextSpan(spans []textSpan, span textSpan) []textSpan {
+	if last := len(spans) - 1; last >= 0 && spans[last].source+spans[last].length == span.source && spans[last].output+spans[last].length == span.output {
+		spans[last].length += span.length
+		return spans
+	}
+	return append(spans, span)
+}
+
+// annotateInteractionTexts 把引用写入所在 text 内容的 annotations，没有区间的引用写入最后一段 text 内容
+func annotateInteractionTexts(texts []*interactionText, citations []aistudio.Citation) {
+	if len(texts) == 0 {
+		return
+	}
+	for _, citation := range citations {
+		targets := texts
+		if citation.End == 0 {
+			targets = texts[len(texts)-1:]
+		}
+		for _, text := range targets {
+			if annotation, ok := interactionAnnotation(citation, text.spans); ok {
+				annotations, _ := text.content["annotations"].([]map[string]any)
+				text.content["annotations"] = append(annotations, annotation)
+				break
+			}
+		}
+	}
+}
+
+// interactionSteps 汇总完整内容并将所有 PCM 分块封装为一段音频，引用写入所在 text 内容
+func interactionSteps(result generationResult, audio outputAudioFormat, summaries bool) ([]map[string]any, error) {
+	steps := make([]map[string]any, 0)
+	audioWritten := false
+	texts := make([]*interactionText, 0)
+	var current *interactionText
+	var codeIDs codeExecutionIDs
+	source := 0
+	for _, event := range result.events {
+		event.Part = codeIDs.assign(event.Part)
+		if signature := interactionOutputSignature(event); signature != "" {
+			steps = append(steps, map[string]any{"type": "thought", "signature": signature})
+		}
+		if event.Kind == aistudio.EventReasoning && !summaries {
+			if event.ThoughtSignature == "" {
+				continue
+			}
+			event.Kind = aistudio.EventThoughtSignature
+		}
+		if event.Kind == aistudio.EventMedia && event.InlineData != nil && strings.HasPrefix(event.InlineData.MIME, "audio/") {
+			if audioWritten {
+				continue
+			}
+			audio, err := joinedAudio(result.media)
+			if err != nil {
+				return nil, err
+			}
+			event.InlineData = &audio
+			audioWritten = true
+		}
+		step, _, err := interactionStep(event, audio)
+		if err != nil {
+			return nil, err
+		}
+		if step == nil {
+			continue
+		}
+		if len(steps) > 0 && step["type"] == steps[len(steps)-1]["type"] && (step["type"] == "model_output" || step["type"] == "thought") {
+			previous := steps[len(steps)-1]
+			field := "content"
+			if step["type"] == "thought" {
+				field = "summary"
+			}
+			items, _ := step[field].([]map[string]any)
+			prior, _ := previous[field].([]map[string]any)
+			for _, item := range items {
+				if len(prior) > 0 && item["type"] == "text" && prior[len(prior)-1]["type"] == "text" {
+					last := prior[len(prior)-1]
+					if words, _ := item["annotations"].([]map[string]any); len(words) > 0 {
+						annotations, _ := last["annotations"].([]map[string]any)
+						last["annotations"] = append(annotations, shiftWordInfos(words, len(last["text"].(string)))...)
+					}
+					last["text"] = last["text"].(string) + item["text"].(string)
+				} else {
+					prior = append(prior, item)
+					current = nil
+					if field == "content" && item["type"] == "text" {
+						current = &interactionText{content: item}
+						texts = append(texts, current)
+					}
+				}
+			}
+			if len(prior) > 0 {
+				previous[field] = prior
+			}
+			if signature, ok := step["signature"]; ok {
+				previous["signature"] = signature
+			}
+		} else {
+			steps = append(steps, step)
+			current = nil
+			if content, _ := step["content"].([]map[string]any); step["type"] == "model_output" && len(content) == 1 && content[0]["type"] == "text" {
+				current = &interactionText{content: content[0]}
+				texts = append(texts, current)
+			}
+		}
+		if event.Kind == aistudio.EventText && current != nil {
+			text := current.content["text"].(string)
+			current.spans = appendTextSpan(current.spans, textSpan{source: source, output: len(text) - len(event.Text), length: len(event.Text)})
+			source += len(event.Text)
+		}
+	}
+	annotateInteractionTexts(texts, result.citations)
+	return steps, nil
+}
+
+// streamInteraction 输出创建、步骤增量、步骤结束与交互终态，返回生成失败的错误
+func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, request interactionRequest, generate aistudio.GenerateRequest, audioExpected bool, previous responseHistory, current []aistudio.Content, created string, events <-chan aistudio.Event) error {
+	if err := streamHeaders(w); err != nil {
+		return nil
+	}
+	send := func(kind string, value map[string]any) error {
+		value["event_type"] = kind
+		return writeSSE(w, kind, officialOrder("interactions", value))
+	}
+	if err := send("interaction.created", map[string]any{"interaction": interactionObject(generate, created, "in_progress", nil)}); err != nil {
+		return nil
+	}
+	audio := request.audioFormat()
+	index := -1
+	active := ""
+	var text *interactionText
+	textLength, source := 0, 0
+	pendingSignature := ""
+	var codeIDs codeExecutionIDs
+	closeStep := func() error {
+		if active == "" {
+			return nil
+		}
+		active = ""
+		return send("step.stop", map[string]any{"index": index})
+	}
+	var emit func(aistudio.Event) error
+	// flushSignature 输出正文步骤打开期间暂存的独立思考签名
+	flushSignature := func() error {
+		if pendingSignature == "" {
+			return nil
+		}
+		signature := pendingSignature
+		pendingSignature, text = "", nil
+		return emit(aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: signature})
+	}
+	emit = func(event aistudio.Event) error {
+		if event.Kind == aistudio.EventReasoning && request.Generation.ThinkingSummaries == "none" {
+			if event.ThoughtSignature == "" {
+				return nil
+			}
+			event.Kind = aistudio.EventThoughtSignature
+		}
+		citations := interactionCitations(event)
+		if signature := interactionOutputSignature(event); signature != "" {
+			if err := emit(aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: signature}); err != nil {
+				return err
+			}
+		}
+		if len(citations) > 0 {
+			if text == nil {
+				return nil
+			}
+			annotations := make([]map[string]any, 0, len(citations))
+			for _, citation := range citations {
+				if annotation, ok := interactionAnnotation(citation, text.spans); ok {
+					annotations = append(annotations, annotation)
+				}
+			}
+			if len(annotations) == 0 {
+				return nil
+			}
+			return send("step.delta", map[string]any{"index": index, "delta": map[string]any{"type": "text_annotation_delta", "annotations": annotations}})
+		}
+		event.Part = codeIDs.assign(event.Part)
+		step, delta, err := interactionStep(event, audio)
+		if err != nil || step == nil {
+			return err
+		}
+		kind := step["type"].(string)
+		if delta == nil || delta["type"] != "text" || kind != "model_output" {
+			text = nil
+		} else if text == nil {
+			text, textLength = &interactionText{}, 0
+		}
+		if text != nil {
+			length := len(delta["text"].(string))
+			if event.Kind == aistudio.EventText {
+				text.spans = appendTextSpan(text.spans, textSpan{source: source, output: textLength, length: length})
+				source += length
+			}
+			textLength += length
+		}
+		standalone := kind == "function_call" || interactionToolStepKind(kind)
+		if active != kind || standalone {
+			if err := closeStep(); err != nil {
+				return err
+			}
+			index++
+			active = kind
+			start := map[string]any{"type": kind}
+			if kind == "model_output" {
+				start["content"] = []any{}
+			}
+			if kind == "thought" {
+				start["summary"] = []any{}
+			}
+			if standalone {
+				start = maps.Clone(step)
+				delete(start, "signature")
+			}
+			if err := send("step.start", map[string]any{"index": index, "step": start}); err != nil {
+				return err
+			}
+		}
+		if delta == nil {
+			return nil
+		}
+		words, _ := delta["annotations"].([]map[string]any)
+		if len(words) > 0 {
+			delta = map[string]any{"type": "text", "text": delta["text"]}
+		}
+		if err := send("step.delta", map[string]any{"index": index, "delta": delta}); err != nil || len(words) == 0 {
+			return err
+		}
+		return send("step.delta", map[string]any{"index": index, "delta": map[string]any{"type": "text_annotation_delta", "annotations": shiftWordInfos(words, textLength-len(delta["text"].(string)))}})
+	}
+	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
+		if event.Kind == aistudio.EventMedia && event.InlineData != nil && strings.HasPrefix(event.InlineData.MIME, "audio/") && !audio.streams(*event.InlineData) {
+			return nil
+		}
+		if len(interactionCitations(event)) == 0 {
+			if err := flushSignature(); err != nil {
+				return err
+			}
+		}
+		if text != nil && (event.Kind == aistudio.EventThoughtSignature || event.Kind == aistudio.EventText && event.Text == "" && event.ThoughtSignature != "") {
+			pendingSignature = event.ThoughtSignature
+			return nil
+		}
+		return emit(event)
+	}, func() error { return writeSSEHeartbeat(w) })
+	if err == nil {
+		for _, media := range result.media {
+			if !strings.HasPrefix(media.MIME, "audio/") || audio.streams(media) {
+				continue
+			}
+			var audio aistudio.Blob
+			audio, err = joinedAudio(result.media)
+			if err == nil {
+				err = emit(aistudio.Event{Kind: aistudio.EventMedia, InlineData: &audio})
+			}
+			break
+		}
+	}
+	if err == nil {
+		err = validateInteractionResult(audioExpected, result)
+	}
+	if err != nil {
+		SetAccessLogError(r.Context(), err)
+		if shouldWriteRequestError(r, err) {
+			_ = send("error", map[string]any{"error": map[string]any{"code": geminiErrorStatus(err), "message": err.Error()}})
+		}
+		return err
+	}
+	if err := closeStep(); err != nil {
+		return nil
+	}
+	completed := interactionObject(generate, created, interactionStatus(result), &result)
+	if request.Store == nil || *request.Store {
+		s.storeInteraction(request, previous, current, result, completed)
+	}
+	if err := send("interaction.completed", map[string]any{"interaction": completed}); err != nil {
+		SetAccessLogError(r.Context(), fmt.Errorf("interaction completion: %w", err))
+	}
+	return nil
+}
+
+// interactionOutputSignature 提取函数调用、正文与媒体携带的可回传思考签名，输出为其前的 thought 步骤
+func interactionOutputSignature(event aistudio.Event) string {
+	switch event.Kind {
+	case aistudio.EventToolCall:
+		return cmp.Or(event.FunctionCall.ThoughtSignature, event.ThoughtSignature)
+	case aistudio.EventText, aistudio.EventMedia:
+		return event.ThoughtSignature
+	}
+	return ""
+}
