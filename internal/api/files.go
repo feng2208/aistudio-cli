@@ -277,16 +277,14 @@ func (s *server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 	writeMediaStream(w, r, media.Body, size)
 }
 
-// writeMediaStream 写出 200 与文件内容，size 非负时带 Content-Length，复制或关闭出错时记入访问日志
-func writeMediaStream(w http.ResponseWriter, r *http.Request, body io.ReadCloser, size int64) {
+// writeMediaStream 写出 200 与文件内容，size 非负时带 Content-Length
+func writeMediaStream(w http.ResponseWriter, _ *http.Request, body io.ReadCloser, size int64) {
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
 	w.WriteHeader(http.StatusOK)
 	_, copyErr := io.Copy(w, body)
-	if err := errors.Join(copyErr, body.Close()); err != nil {
-		SetAccessLogError(r.Context(), err)
-	}
+	_ = errors.Join(copyErr, body.Close())
 }
 
 // handleFileDelete 删除上传文件

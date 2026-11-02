@@ -50,6 +50,28 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
+const (
+	waaBackendCamoufox     = "camoufox"
+	waaBackendSpiderMonkey = "spidermonkey"
+)
+
+// resolveWAABackend 按 flag、WAA_BACKEND 环境变量、默认 camoufox 的顺序确定 WAA 后端
+func resolveWAABackend(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		value = strings.ToLower(strings.TrimSpace(os.Getenv("WAA_BACKEND")))
+	}
+	if value == "" {
+		value = waaBackendCamoufox
+	}
+	switch value {
+	case waaBackendCamoufox, waaBackendSpiderMonkey:
+		return value, nil
+	default:
+		return "", fmt.Errorf("WAA 后端必须是 %s 或 %s", waaBackendCamoufox, waaBackendSpiderMonkey)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -191,9 +213,9 @@ func handleModelsCommand(ctx context.Context, args []string) error {
 	defer cancel()
 
 	rt, cleanup, err := setupRuntime(reqCtx, runtimeOptions{
-		AuthDirs:     authDirs,
-		GlobalProxy:  globalProxy,
-		NeedCamoufox: false,
+		AuthDirs:    authDirs,
+		GlobalProxy: globalProxy,
+		NeedWAA:     false,
 	})
 	if err != nil {
 		return err
@@ -235,10 +257,12 @@ func handleGenerateCommand(ctx context.Context, args []string) error {
 	var initTimeout timeDuration = timeDuration{Duration: 2 * time.Minute}
 	var temporaryChat bool
 	var verbose bool
+	var waaBackend string
 
 	fs.Var(&authDirs, "auth-dir", "账户目录，可重复或逗号分隔 (默认 auth)")
 	fs.StringVar(&globalProxy, "proxy", "", "全局 HTTP/SOCKS5 代理")
-	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (若不指定则自动定位或下载)")
+	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (仅 camoufox 后端；不指定时自动定位或下载)")
+	fs.StringVar(&waaBackend, "waa-backend", "", "WAA 后端：camoufox 或 spidermonkey (默认 camoufox，也可用 WAA_BACKEND 环境变量)")
 	fs.StringVar(&modelID, "model", "gemini-2.5-flash", "目标模型 ID")
 	fs.StringVar(&prompt, "prompt", "", "提示词内容 (若为 '-' 或空且 stdin 有内容则从标准输入读取)")
 	fs.StringVar(&promptFile, "prompt-file", "", "从指定文本文件读取提示词")
@@ -247,7 +271,7 @@ func handleGenerateCommand(ctx context.Context, args []string) error {
 	fs.BoolVar(&stream, "stream", true, "是否流式输出生成内容 (默认 true)")
 	fs.BoolVar(&asJSON, "json", false, "输出 JSON/NDJSON 格式结果")
 	fs.Var(&timeout, "timeout", "生成总超时时间 (默认 30m)")
-	fs.Var(&initTimeout, "init-timeout", "Camoufox WAA 初始化超时 (默认 2m)")
+	fs.Var(&initTimeout, "init-timeout", "WAA 初始化超时 (默认 2m)")
 	fs.BoolVar(&temporaryChat, "temporary-chat", false, "WAA 是否使用临时对话模式")
 	fs.BoolVar(&verbose, "verbose", false, "输出调试日志到 stderr")
 
@@ -269,16 +293,25 @@ func handleGenerateCommand(ctx context.Context, args []string) error {
 		authDirs = []string{"auth"}
 	}
 
-	if camoufoxPath != "" {
-		_ = os.Setenv("CAMOUFOX_PATH", camoufoxPath)
+	backend, err := resolveWAABackend(waaBackend)
+	if err != nil {
+		return err
 	}
 
-	slog.Info("正在查找或准备 Camoufox 运行环境...")
-	realCamoufoxPath, err := camoufoxnative.FindExecutable(ctx, globalProxy)
-	if err != nil {
-		return fmt.Errorf("准备 Camoufox 浏览器环境失败: %w", err)
+	realCamoufoxPath := ""
+	if backend == waaBackendCamoufox {
+		if camoufoxPath != "" {
+			_ = os.Setenv("CAMOUFOX_PATH", camoufoxPath)
+		}
+		slog.Info("正在查找或准备 Camoufox 运行环境...")
+		realCamoufoxPath, err = camoufoxnative.FindExecutable(ctx, globalProxy)
+		if err != nil {
+			return fmt.Errorf("准备 Camoufox 浏览器环境失败: %w", err)
+		}
+		slog.Info("Camoufox 环境就绪", "path", realCamoufoxPath)
+	} else if camoufoxPath != "" {
+		return fmt.Errorf("--camoufox-path 仅适用于 camoufox WAA 后端")
 	}
-	slog.Info("Camoufox 环境就绪", "path", realCamoufoxPath)
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout.Duration)
 	defer cancel()
@@ -287,8 +320,9 @@ func handleGenerateCommand(ctx context.Context, args []string) error {
 		AuthDirs:      authDirs,
 		GlobalProxy:   globalProxy,
 		CamoufoxPath:  realCamoufoxPath,
+		WAABackend:    backend,
 		InitTimeout:   initTimeout,
-		NeedCamoufox:  true,
+		NeedWAA:       true,
 		TemporaryChat: temporaryChat,
 	})
 	if err != nil {

@@ -12,11 +12,12 @@ import (
 	"aistudio-cli/internal/camoufoxnative"
 )
 
-// camoufoxWorkerPool 维护已启动的 Camoufox WAA worker
-type camoufoxWorkerPool struct {
+// waaWorkerPool 维护已启动的 Camoufox 或 SpiderMonkey WAA worker
+type waaWorkerPool struct {
 	mu            sync.Mutex
 	workers       map[string]*aistudio.NativeWorker
 	pool          *aistudio.AccountPool
+	backend       string
 	camoufoxPath  string
 	globalProxy   string
 	initTimeout   time.Duration
@@ -24,16 +25,18 @@ type camoufoxWorkerPool struct {
 	closed        bool
 }
 
-func newCamoufoxWorkerPool(
+func newWAAWorkerPool(
 	pool *aistudio.AccountPool,
+	backend string,
 	camoufoxPath string,
 	globalProxy string,
 	initTimeout time.Duration,
 	temporaryChat bool,
-) *camoufoxWorkerPool {
-	return &camoufoxWorkerPool{
+) *waaWorkerPool {
+	return &waaWorkerPool{
 		workers:       make(map[string]*aistudio.NativeWorker),
 		pool:          pool,
+		backend:       backend,
 		camoufoxPath:  camoufoxPath,
 		globalProxy:   strings.TrimSpace(globalProxy),
 		initTimeout:   initTimeout,
@@ -42,7 +45,7 @@ func newCamoufoxWorkerPool(
 }
 
 // Worker 实现 aistudio.ProtectedPreparerProvider 接口
-func (m *camoufoxWorkerPool) Worker(ctx context.Context, accountID string, modelID string) (aistudio.ProtectedPreparer, error) {
+func (m *waaWorkerPool) Worker(ctx context.Context, accountID string, modelID string) (aistudio.ProtectedPreparer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -81,29 +84,34 @@ func (m *camoufoxWorkerPool) Worker(ctx context.Context, accountID string, model
 		TemporaryChat:    m.temporaryChat,
 		AuthUser:         account.Config.AuthUser,
 		StartupProgress: func(stage camoufoxnative.StartupStage) {
-			slog.Debug("Camoufox WAA worker 启动进度", "account", accountID, "stage", stage)
+			slog.Debug("WAA worker 启动进度", "backend", m.backend, "account", accountID, "stage", stage)
 		},
 	}
 
 	initCtx, cancel := context.WithTimeout(ctx, m.initTimeout)
 	defer cancel()
 
-	slog.Info("正在初始化 Camoufox WAA worker", "account", accountID, "model", bootstrapModel)
-	worker, err := aistudio.NewNativeWorker(initCtx, accountID, options)
+	slog.Info("正在初始化 WAA worker", "backend", m.backend, "account", accountID, "model", bootstrapModel)
+	var worker *aistudio.NativeWorker
+	if m.backend == waaBackendSpiderMonkey {
+		worker, err = aistudio.NewSpiderMonkeyWorker(initCtx, accountID, options)
+	} else {
+		worker, err = aistudio.NewNativeWorker(initCtx, accountID, options)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("启动 Camoufox WAA worker (%s): %w", accountID, err)
+		return nil, fmt.Errorf("启动 %s WAA worker (%s): %w", m.backend, accountID, err)
 	}
 
 	m.workers[accountID] = worker
 	return worker, nil
 }
 
-func (m *camoufoxWorkerPool) Close() {
+func (m *waaWorkerPool) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
 	for id, worker := range m.workers {
-		slog.Debug("正在关闭 Camoufox WAA worker", "account", id)
+		slog.Debug("正在关闭 WAA worker", "backend", m.backend, "account", id)
 		_ = worker.Close()
 	}
 	m.workers = make(map[string]*aistudio.NativeWorker)

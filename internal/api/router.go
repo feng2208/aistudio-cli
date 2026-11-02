@@ -13,16 +13,7 @@ import (
 
 // Config 定义公开 API 服务配置
 type Config struct {
-	APIKey           string
-	Admin            AdminService
-	AdminAuthEnabled bool
-	AdminUsername    string
-	AdminPassword    string
-	// AdminSessionPath 是记住我的管理会话文件
-	AdminSessionPath string
-	Ledger           RequestLedger
-	Prompts          PromptStore
-	Updates          UpdateService
+	APIKey string
 	// MediaDir 是媒体 URL 模式下生成媒体的保存目录
 	MediaDir string
 	// MediaLinks 返回媒体输出是否使用 URL 与设置的服务地址
@@ -52,8 +43,6 @@ type server struct {
 	uploads           *geminiUploads
 	caches            *geminiCaches
 	thoughtSignatures *thoughtSignatureStore
-	pairing           *pairingTokens
-	loginViews        *loginViews
 	// background 按响应 ID 保存进行中的 Responses 后台响应
 	background sync.Map
 }
@@ -64,7 +53,7 @@ var idSequence atomic.Uint64
 func NewHandler(service aistudio.Service, config Config) http.Handler {
 	s := &server{
 		service: service, config: config, responseStates: newResponseStateStore(), uploads: newGeminiUploads(), caches: newGeminiCaches(),
-		thoughtSignatures: newThoughtSignatureStore(), pairing: &pairingTokens{}, loginViews: &loginViews{},
+		thoughtSignatures: newThoughtSignatureStore(),
 	}
 	public := http.NewServeMux()
 	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)
@@ -120,27 +109,20 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("PATCH /v1beta/cachedContents/{cache}", s.handleGeminiCacheUpdate)
 	public.HandleFunc("DELETE /v1beta/cachedContents/{cache}", s.handleGeminiCacheDelete)
 
-	control := http.NewServeMux()
-	control.HandleFunc("GET /api/status", s.handleStatus)
-	control.HandleFunc("GET /api/models", s.handleAdminModels)
-	s.registerAdmin(control)
-	s.registerLedger(control)
-	s.registerPrompts(control)
-	s.registerUpdates(control)
-
 	root := http.NewServeMux()
-	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, public)))))
-	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
-	root.Handle("/v1/", loggedHandler)
-	root.Handle("/v1beta/", loggedHandler)
-	root.Handle("/upload/", requestLoggingMiddleware(config.Admin, corsMiddleware(s.geminiUploadHandler(publicHandler))))
-	root.Handle("/api/", newAdminAuth(config).handler(control))
+	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(handleHealth)))
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, waitLaunchMiddleware(config.WaitLaunch, public))))
+	root.Handle("/v1/", corsMiddleware(publicHandler))
+	root.Handle("/v1beta/", corsMiddleware(publicHandler))
+	root.Handle("/upload/", corsMiddleware(s.geminiUploadHandler(publicHandler)))
 	if config.MediaDir != "" {
 		root.Handle("GET /media/{file}", corsMiddleware(http.HandlerFunc(s.handleMedia)))
 	}
-	root.HandleFunc("POST /api/pairing/accounts", s.handlePairingAccount)
 	return root
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，wait 为空时直接处理

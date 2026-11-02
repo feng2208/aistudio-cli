@@ -170,14 +170,13 @@ func (s *server) generateImages(ctx context.Context, request aistudio.GenerateRe
 	images := s.startChatChoices(ctx, request, count, false)
 	defer images.cancel()
 	if err := images.err; err != nil {
-		images.settle(ctx)
+		images.settle()
 		return nil, err
 	}
 	results, err := images.run(func(_ int, events <-chan aistudio.Event) (generationResult, error) {
 		return consumeEvents(images.ctx, events)
 	})
-	images.settle(ctx)
-	images.record(ctx, results)
+	images.settle()
 	return results, err
 }
 

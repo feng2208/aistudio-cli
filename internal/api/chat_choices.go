@@ -125,26 +125,13 @@ func (choices *chatChoices) run(consume func(int, <-chan aistudio.Event) (genera
 	return results, choices.err
 }
 
-// settle 取消未结束的生成；多个 choice 时等待各生成退出，再把访问日志的错误设为首个错误
-func (choices *chatChoices) settle(ctx context.Context) {
+// settle 取消未结束的生成；多个 choice 时等待各生成退出
+func (choices *chatChoices) settle() {
 	choices.cancel()
 	if len(choices.events) < 2 {
 		return
 	}
 	choices.running.Wait()
-	SetAccessLogError(ctx, choices.err)
-}
-
-// record 在多个 choice 时把用量与工具调用数之和写入访问日志
-func (choices *chatChoices) record(ctx context.Context, results []generationResult) {
-	if len(choices.events) < 2 {
-		return
-	}
-	toolCalls := 0
-	for index := range results {
-		toolCalls += len(results[index].toolCalls)
-	}
-	SetAccessLogGenerationResult(ctx, sumUsage(results), toolCalls)
 }
 
 // sumUsage 返回各次生成用量之和，多次生成时不带模态细分，均无用量时返回 nil

@@ -50,12 +50,18 @@ Optional flags:
 
 - `--api-key`: require `Authorization: Bearer <key>` on public API requests.
 - `--proxy`: global HTTP/SOCKS5 proxy.
-- `--camoufox-path`: use a specific Camoufox executable.
+- `--waa-backend`: WAA backend, either `camoufox` (default) or `spidermonkey`.
+  The default can also be set with the `WAA_BACKEND` environment variable; the
+  flag takes precedence.
+- `--camoufox-path`: use a specific Camoufox executable (camoufox backend only).
 - `--init-timeout`, `--startup-timeout`, `--request-timeout`: timeout controls.
 - `--temporary-chat`, `--prewarm`, `--verbose`: WAA and logging options.
 
-The server exposes `/v1/`, `/v1beta/`, `/upload/`, and `/health`. The admin
-routes from the upstream web application are not exposed.
+The `spidermonkey` backend does not require a Camoufox download, but it still
+needs the cgo SpiderMonkey libraries at build time.
+
+The server exposes `/v1/`, `/v1beta/`, `/upload/`, and `/health`. The upstream
+admin/control-plane routes are not part of this CLI and have been removed.
 
 ## Releases
 

@@ -3,7 +3,6 @@ package api
 import (
 	"cmp"
 	"encoding/base64"
-	"fmt"
 	"maps"
 	"mime"
 	"net/http"
@@ -459,7 +458,6 @@ func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, reque
 		err = validateInteractionResult(audioExpected, result)
 	}
 	if err != nil {
-		SetAccessLogError(r.Context(), err)
 		if shouldWriteRequestError(r, err) {
 			_ = send("error", map[string]any{"error": map[string]any{"code": geminiErrorStatus(err), "message": err.Error()}})
 		}
@@ -472,9 +470,7 @@ func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, reque
 	if request.Store == nil || *request.Store {
 		s.storeInteraction(request, previous, current, result, completed)
 	}
-	if err := send("interaction.completed", map[string]any{"interaction": completed}); err != nil {
-		SetAccessLogError(r.Context(), fmt.Errorf("interaction completion: %w", err))
-	}
+	_ = send("interaction.completed", map[string]any{"interaction": completed})
 	return nil
 }
 

@@ -271,7 +271,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	choices := s.startChatChoices(r.Context(), generateRequest, count, request.Stream)
 	defer choices.cancel()
 	if err := choices.err; err != nil {
-		choices.settle(r.Context())
+		choices.settle()
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)
 		}
@@ -286,7 +286,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return consumeEvents(choices.ctx, events)
 	})
 	if err != nil {
-		choices.settle(r.Context())
+		choices.settle()
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)
 		}
@@ -295,7 +295,6 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	for index := range results {
 		s.thoughtSignatures.Remember(results[index].toolCalls)
 	}
-	choices.record(r.Context(), results)
 	format, _, _ := request.audioOutput()
 	audio := make([]map[string]any, len(results))
 	for index := range results {
@@ -1183,7 +1182,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 		return result, write(index, finalDelta, &finish)
 	})
 	if err != nil {
-		choices.settle(r.Context())
+		choices.settle()
 		if shouldWriteRequestError(r, err) {
 			status := statusFromError(err)
 			code := openAIErrorCode(err)
@@ -1193,7 +1192,6 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 		}
 		return
 	}
-	choices.record(r.Context(), results)
 	if usage := sumUsage(results); request.StreamOptions.IncludeUsage && usage != nil {
 		chunk := map[string]any{
 			"id":      id,

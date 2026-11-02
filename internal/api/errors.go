@@ -198,7 +198,6 @@ func writeGeminiAuthError(w http.ResponseWriter, r *http.Request) {
 			geminiLocalizedMessage{Type: "type.googleapis.com/google.rpc.LocalizedMessage", Locale: "en-US", Message: geminiInvalidKeyMessage},
 		}}
 	}
-	setAccessLogResponseError(w, failure.Message)
 	var payload any = map[string]geminiAuthFailure{"error": failure}
 	if interactionsPath(r.URL.Path) || strings.HasSuffix(r.URL.Path, ":streamGenerateContent") && r.URL.Query().Get("alt") != "sse" {
 		payload = []any{payload}
@@ -241,7 +240,6 @@ func publicErrorMessage(status int, message string) string {
 
 func writeOpenAIError(w http.ResponseWriter, status int, code string, message string) {
 	message = publicErrorMessage(status, message)
-	setAccessLogResponseError(w, message)
 	writeJSON(w, status, map[string]any{"error": openAIErrorBody{Message: message, Type: openAIErrorType(status, code), Code: code}})
 }
 
@@ -265,7 +263,6 @@ func openAIErrorType(status int, code string) string {
 
 func writeAnthropicError(w http.ResponseWriter, status int, errorType string, message string) {
 	message = publicErrorMessage(status, message)
-	setAccessLogResponseError(w, message)
 	writeJSON(w, status, anthropicErrorResponse{Type: "error", Error: anthropicErrorBody{Type: errorType, Message: message}})
 }
 
@@ -282,7 +279,6 @@ type anthropicErrorBody struct {
 }
 
 func writeGeminiError(w http.ResponseWriter, status int, statusName string, message string) {
-	setAccessLogResponseError(w, message)
 	writeJSON(w, status, officialOrder("gemini", map[string]any{"error": map[string]any{
 		"code":    status,
 		"message": message,
@@ -323,7 +319,6 @@ func writeGeminiRequestError(w http.ResponseWriter, err error) {
 	if seconds := setRetryAfter(w, err); seconds > 0 {
 		payload["details"] = []any{map[string]any{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": strconv.FormatInt(seconds, 10) + "s"}}
 	}
-	setAccessLogResponseError(w, err.Error())
 	writeJSON(w, status, officialOrder("gemini", map[string]any{"error": payload}))
 }
 
@@ -341,13 +336,6 @@ func setRetryAfter(w http.ResponseWriter, err error) int64 {
 	seconds := int64(math.Ceil(at.Sub(now).Seconds()))
 	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 	return seconds
-}
-
-func writeAdminError(w http.ResponseWriter, status int, code string, message string) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{
-		"code":    code,
-		"message": message,
-	}})
 }
 
 func openAIErrorCode(err error) string {

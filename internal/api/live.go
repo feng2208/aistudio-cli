@@ -1,13 +1,11 @@
 package api
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -71,15 +69,6 @@ type bidiServerMessage struct {
 	Code          string                      `json:"code,omitempty"`
 }
 
-// Hijack 让 WebSocket upgrade 穿过访问日志响应包装器
-func (writer *accessLogResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	connection, readWriter, err := http.NewResponseController(writer.ResponseWriter).Hijack()
-	if err == nil && writer.status == 0 {
-		writer.status = http.StatusSwitchingProtocols
-	}
-	return connection, readWriter, err
-}
-
 func (s *server) handleGeminiLive(w http.ResponseWriter, r *http.Request) {
 	s.serveBidi(w, r, aistudio.BidiModeLive)
 }
@@ -111,13 +100,11 @@ func (s *server) serveBidi(w http.ResponseWriter, r *http.Request, mode aistudio
 	}
 	request, inputModalities, err := bidiRequestFromSetup(mode, setup)
 	if err != nil {
-		SetAccessLogError(r.Context(), err)
 		_ = writeBidiJSON(connection, bidiServerMessage{Type: "error", Code: "invalid_request", Error: err.Error()})
 		_ = connection.Close()
 		return
 	}
 	_ = connection.SetReadDeadline(time.Time{})
-	startedAt := time.Now()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	clientMessages := make(chan bidiClientMessage, 8)
@@ -125,7 +112,6 @@ func (s *server) serveBidi(w http.ResponseWriter, r *http.Request, mode aistudio
 	go readBidiClientMessages(ctx, cancel, connection, clientMessages, readerDone)
 	session, err := service.OpenBidi(ctx, request)
 	if err != nil {
-		SetAccessLogError(r.Context(), err)
 		_ = writeBidiJSON(connection, bidiErrorMessage(err))
 		_ = connection.Close()
 		cancel()
@@ -136,16 +122,14 @@ func (s *server) serveBidi(w http.ResponseWriter, r *http.Request, mode aistudio
 	writerDone := make(chan struct{})
 	senderDone := make(chan struct{})
 	go s.writeBidiEvents(
-		ctx, connection, r, session, startedAt, request.ModelAccessScope != "", clientErrors, writerDone,
+		ctx, connection, session, request.ModelAccessScope != "", clientErrors, writerDone,
 	)
 	go sendBidiClientMessages(
 		ctx, cancel, session, inputModalities, len(request.Tools) > 0, clientMessages, clientErrors, senderDone,
 	)
 	<-writerDone
 	cancel()
-	if closeErr := session.Close(); closeErr != nil {
-		SetAccessLogError(r.Context(), closeErr)
-	}
+	_ = session.Close()
 	_ = connection.Close()
 	waitBidiRoutine(readerDone)
 	waitBidiRoutine(senderDone)
@@ -361,9 +345,7 @@ func sendBidiClientMessages(
 func (s *server) writeBidiEvents(
 	ctx context.Context,
 	connection *websocket.Conn,
-	r *http.Request,
 	session *aistudio.BidiSession,
-	startedAt time.Time,
 	mediaScoped bool,
 	clientErrors <-chan error,
 	done chan<- struct{},
@@ -373,24 +355,17 @@ func (s *server) writeBidiEvents(
 	if err := writeBidiJSON(connection, bidiServerMessage{Type: "session_opened", Model: session.Model()}); err != nil {
 		return
 	}
-	first := true
 	for {
 		select {
 		case err := <-clientErrors:
-			SetAccessLogError(r.Context(), err)
 			_ = writeBidiJSON(connection, bidiErrorMessage(err))
 			return
 		case event, ok := <-session.Events():
 			if !ok {
 				return
 			}
-			if first {
-				SetAccessLogFirstEvent(r.Context(), time.Since(startedAt))
-				first = false
-			}
 			message := mapBidiServerEvent(event)
 			if event.Err != nil {
-				SetAccessLogError(r.Context(), event.Err)
 				message = bidiErrorMessage(event.Err)
 				message.Raw = event.Raw
 			}

@@ -1238,7 +1238,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	candidates := s.startChatChoices(r.Context(), request, count, stream)
 	defer candidates.cancel()
 	if err := candidates.err; err != nil {
-		candidates.settle(r.Context())
+		candidates.settle()
 		writeGeminiFailure(w, r, request, err, stream)
 		return
 	}
@@ -1254,11 +1254,10 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		return result, err
 	})
 	if err != nil {
-		candidates.settle(r.Context())
+		candidates.settle()
 		writeGeminiFailure(w, r, request, err, false)
 		return
 	}
-	candidates.record(r.Context(), results)
 	writeJSON(w, http.StatusOK, officialOrder("gemini", buildGeminiResponse(request, results)))
 }
 
@@ -1804,7 +1803,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		return result, err
 	})
 	if err != nil {
-		candidates.settle(r.Context())
+		candidates.settle()
 		if !shouldWriteRequestError(r, err) {
 			return
 		}
@@ -1817,7 +1816,6 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		}})
 		return
 	}
-	candidates.record(r.Context(), results)
 	finished := make([]any, 0, len(results))
 	for index, result := range results {
 		candidate := map[string]any{"index": index, "content": map[string]any{"role": "model", "parts": append([]any{}, finalParts[index]...)}}

@@ -19,6 +19,8 @@ import (
 // bidiCommandTimeout 为单条 BiDi 命令等待响应的最长时间
 const bidiCommandTimeout = 150 * time.Second
 
+const accessTokenPath = "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateAccessToken"
+
 type bidiClient struct {
 	connection *websocket.Conn
 	// writeLock 串行化连接写入

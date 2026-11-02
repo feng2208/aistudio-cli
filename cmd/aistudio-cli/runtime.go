@@ -15,15 +15,16 @@ type cliRuntime struct {
 	Client    *aistudio.Client
 	Headers   *accountHeaderProvider
 	Transport *aistudio.MakerSuiteHTTPTransport
-	Workers   *camoufoxWorkerPool
+	Workers   *waaWorkerPool
 }
 
 type runtimeOptions struct {
 	AuthDirs      []string
 	GlobalProxy   string
 	CamoufoxPath  string
+	WAABackend    string
 	InitTimeout   timeDuration
-	NeedCamoufox  bool
+	NeedWAA       bool
 	TemporaryChat bool
 }
 
@@ -60,11 +61,12 @@ func setupRuntime(ctx context.Context, opts runtimeOptions) (*cliRuntime, func()
 		return nil, nil, fmt.Errorf("创建 HTTP 传输层失败: %w", err)
 	}
 
-	var workers *camoufoxWorkerPool
+	var workers *waaWorkerPool
 	var protected aistudio.ProtectedTransport
-	if opts.NeedCamoufox {
-		workers = newCamoufoxWorkerPool(
+	if opts.NeedWAA {
+		workers = newWAAWorkerPool(
 			pool,
+			opts.WAABackend,
 			opts.CamoufoxPath,
 			opts.GlobalProxy,
 			opts.InitTimeout.Duration,

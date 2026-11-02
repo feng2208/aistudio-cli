@@ -146,9 +146,6 @@ func consumeStreamEvents(
 	emit func(aistudio.Event) error,
 	heartbeat func() error,
 ) (result generationResult, resultErr error) {
-	defer func() {
-		SetAccessLogError(ctx, resultErr)
-	}()
 	heartbeatTimer := time.NewTimer(streamHeartbeatInterval)
 	defer heartbeatTimer.Stop()
 	var heartbeatTick <-chan time.Time

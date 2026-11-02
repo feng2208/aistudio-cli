@@ -288,7 +288,6 @@ func (s *server) handleGeminiUploadChunk(w http.ResponseWriter, r *http.Request)
 		writeGeminiUploadError(w, http.StatusNotFound, "NOT_FOUND", "upload session was not found", "final")
 		return
 	}
-	markAccessLogAuthorized(r.Context())
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.done {

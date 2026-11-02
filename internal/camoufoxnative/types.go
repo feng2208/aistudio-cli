@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -54,8 +55,6 @@ type Options struct {
 	ReadyTimeout     time.Duration
 	Log              io.Writer
 	StartupProgress  func(StartupStage)
-	// liveView 表示无头画面实时显示在管理页登录窗口，页面保持 Firefox 默认刷新帧率
-	liveView bool
 }
 
 func (options Options) reportStartup(stage StartupStage) {
@@ -98,4 +97,40 @@ type storageOrigin struct {
 type localStorageItem struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+func decodeStorageCookie(value map[string]any) (storageCookie, bool) {
+	name, _ := value["name"].(string)
+	domain, _ := value["domain"].(string)
+	path, _ := value["path"].(string)
+	if name == "" || domain == "" || path == "" {
+		return storageCookie{}, false
+	}
+	expires := float64(-1)
+	if value["expiry"] != nil {
+		if parsed, ok := number(value["expiry"]); ok {
+			expires = parsed
+		}
+	}
+	sameSite, _ := value["sameSite"].(string)
+	sameSite = strings.ToLower(strings.TrimSpace(sameSite))
+	if sameSite != "none" && sameSite != "lax" && sameSite != "strict" {
+		sameSite = ""
+	} else {
+		sameSite = strings.ToUpper(sameSite[:1]) + sameSite[1:]
+	}
+	partitionKey, _ := value["partitionKey"].(string)
+	httpOnly, _ := value["httpOnly"].(bool)
+	secure, _ := value["secure"].(bool)
+	return storageCookie{
+		Name:         name,
+		Value:        remoteBytesValue(value["value"]),
+		Domain:       domain,
+		Path:         path,
+		Expires:      expires,
+		HTTPOnly:     httpOnly,
+		Secure:       secure,
+		SameSite:     sameSite,
+		PartitionKey: partitionKey,
+	}, true
 }

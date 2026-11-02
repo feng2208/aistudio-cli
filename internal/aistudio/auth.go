@@ -1,7 +1,6 @@
 package aistudio
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,8 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"aistudio-cli/internal/camoufoxnative"
 )
 
 // StateCookie 表示 Playwright storage state 中的 Cookie
@@ -114,29 +111,6 @@ func (s StorageState) AuthExtension() (AuthExtension, bool, error) {
 		return AuthExtension{}, true, fmt.Errorf("解析认证扩展: %w", err)
 	}
 	return extension, true, nil
-}
-
-// IsolatedLoginRequest 描述独立浏览器登录所需的稳定环境，View 不为空时登录画面显示在管理页登录窗口
-type IsolatedLoginRequest struct {
-	Directory string
-	Proxy     string
-	Locale    string
-	Timezone  string
-	View      *camoufoxnative.LiveView
-}
-
-// IsolatedLoginResult 返回独立浏览器导出的认证状态
-type IsolatedLoginResult struct {
-	StorageState StorageState
-	Email        string
-	VerifiedAt   time.Time
-	DriveError   string
-	CloseError   string
-}
-
-// IsolatedLoginDriver 定义独立浏览器登录
-type IsolatedLoginDriver interface {
-	Login(context.Context, IsolatedLoginRequest) (IsolatedLoginResult, error)
 }
 
 // LoadStorageState 读取并校验 Playwright storage state

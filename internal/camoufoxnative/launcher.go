@@ -86,7 +86,7 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
 	}
-	if options.Headless && !options.liveView {
+	if options.Headless {
 		prefs["layout.frame_rate"] = headlessFrameRate
 		// gfx.webrender.enable-subpixel-aa 为 false 时 WebRender 把字形光栅化到单通道图集，不分配 RGBA 字形图集
 		prefs["gfx.webrender.enable-subpixel-aa"] = false

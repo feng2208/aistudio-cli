@@ -182,7 +182,6 @@ func replayInteraction(w http.ResponseWriter, r *http.Request, object json.RawMe
 		event.value["event_type"] = event.kind
 		event.value["event_id"] = strconv.Itoa(sequence + 1)
 		if err := writeSSE(w, event.kind, officialOrder("interactions", event.value)); err != nil {
-			SetAccessLogError(r.Context(), err)
 			return
 		}
 	}

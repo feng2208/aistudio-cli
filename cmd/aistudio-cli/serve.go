@@ -28,6 +28,7 @@ func handleServeCommand(ctx context.Context, args []string) error {
 	var temporaryChat bool
 	var prewarm bool
 	var verbose bool
+	var waaBackend string
 	initTimeout := timeDuration{Duration: 2 * time.Minute}
 	startupTimeout := timeDuration{Duration: 2 * time.Minute}
 	requestTimeout := timeDuration{Duration: 30 * time.Minute}
@@ -36,12 +37,13 @@ func handleServeCommand(ctx context.Context, args []string) error {
 	fs.StringVar(&listen, "listen", "127.0.0.1:2048", "HTTP 监听地址")
 	fs.StringVar(&apiKey, "api-key", "", "可选 API key；设置后请求需携带 Authorization: Bearer <key>")
 	fs.StringVar(&globalProxy, "proxy", "", "全局 HTTP/SOCKS5 代理")
-	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (若不指定则自动定位或下载)")
-	fs.Var(&initTimeout, "init-timeout", "Camoufox WAA 初始化超时 (默认 2m)")
+	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (仅 camoufox 后端；不指定时自动定位或下载)")
+	fs.StringVar(&waaBackend, "waa-backend", "", "WAA 后端：camoufox 或 spidermonkey (默认 camoufox，也可用 WAA_BACKEND 环境变量)")
+	fs.Var(&initTimeout, "init-timeout", "WAA 初始化超时 (默认 2m)")
 	fs.Var(&startupTimeout, "startup-timeout", "启动时同步模型目录超时 (默认 2m)")
 	fs.Var(&requestTimeout, "request-timeout", "单次公开 API 请求超时 (默认 30m，0 表示不限制)")
 	fs.BoolVar(&temporaryChat, "temporary-chat", false, "WAA 是否使用临时对话模式")
-	fs.BoolVar(&prewarm, "prewarm", false, "启动后在后台预热一个 Camoufox WAA worker")
+	fs.BoolVar(&prewarm, "prewarm", false, "启动后在后台预热一个 WAA worker")
 	fs.BoolVar(&verbose, "verbose", false, "输出调试日志到 stderr")
 
 	if err := fs.Parse(args); err != nil {
@@ -53,23 +55,34 @@ func handleServeCommand(ctx context.Context, args []string) error {
 	if len(authDirs) == 0 {
 		authDirs = []string{"auth"}
 	}
-	if strings.TrimSpace(camoufoxPath) != "" {
-		_ = os.Setenv("CAMOUFOX_PATH", camoufoxPath)
+
+	backend, err := resolveWAABackend(waaBackend)
+	if err != nil {
+		return err
 	}
 
-	slog.Info("正在查找或准备 Camoufox 运行环境...")
-	realCamoufoxPath, err := camoufoxnative.FindExecutable(ctx, globalProxy)
-	if err != nil {
-		return fmt.Errorf("准备 Camoufox 浏览器环境失败: %w", err)
+	realCamoufoxPath := ""
+	if backend == waaBackendCamoufox {
+		if strings.TrimSpace(camoufoxPath) != "" {
+			_ = os.Setenv("CAMOUFOX_PATH", camoufoxPath)
+		}
+		slog.Info("正在查找或准备 Camoufox 运行环境...")
+		realCamoufoxPath, err = camoufoxnative.FindExecutable(ctx, globalProxy)
+		if err != nil {
+			return fmt.Errorf("准备 Camoufox 浏览器环境失败: %w", err)
+		}
+		slog.Info("Camoufox 环境就绪", "path", realCamoufoxPath)
+	} else if strings.TrimSpace(camoufoxPath) != "" {
+		return fmt.Errorf("--camoufox-path 仅适用于 camoufox WAA 后端")
 	}
-	slog.Info("Camoufox 环境就绪", "path", realCamoufoxPath)
 
 	rt, cleanup, err := setupRuntime(ctx, runtimeOptions{
 		AuthDirs:      authDirs,
 		GlobalProxy:   globalProxy,
 		CamoufoxPath:  realCamoufoxPath,
+		WAABackend:    backend,
 		InitTimeout:   initTimeout,
-		NeedCamoufox:  true,
+		NeedWAA:       true,
 		TemporaryChat: temporaryChat,
 	})
 	if err != nil {
@@ -162,7 +175,7 @@ func requestTimeoutMiddleware(timeout time.Duration, next http.Handler) http.Han
 	})
 }
 
-// prewarmServeWorker 在后台启动一个 Camoufox WAA worker，降低首个生成请求的冷启动延迟
+// prewarmServeWorker 在后台启动一个 WAA worker，降低首个生成请求的冷启动延迟
 func prewarmServeWorker(ctx context.Context, rt *cliRuntime, timeout time.Duration) {
 	if rt == nil || rt.Workers == nil || rt.Pool == nil {
 		return
@@ -179,10 +192,10 @@ func prewarmServeWorker(ctx context.Context, rt *cliRuntime, timeout time.Durati
 		_, err := rt.Workers.Worker(prewarmCtx, status.ID, status.Models[0])
 		cancel()
 		if err != nil {
-			slog.Warn("Camoufox WAA 预热失败", "account", status.ID, "error", err)
+			slog.Warn("WAA 预热失败", "account", status.ID, "error", err)
 			return
 		}
-		slog.Info("Camoufox WAA 预热完成", "account", status.ID, "elapsed", time.Since(started).Round(time.Millisecond))
+		slog.Info("WAA 预热完成", "account", status.ID, "elapsed", time.Since(started).Round(time.Millisecond))
 		return
 	}
 	slog.Warn("没有可预热的账户")

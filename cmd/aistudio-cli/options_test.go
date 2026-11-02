@@ -54,6 +54,43 @@ func TestEventCollectorNonStream(t *testing.T) {
 	}
 }
 
+func TestResolveWAABackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		flag    string
+		env     string
+		want    string
+		wantErr bool
+	}{
+		{name: "default camoufox", want: waaBackendCamoufox},
+		{name: "env spidermonkey", env: "spidermonkey", want: waaBackendSpiderMonkey},
+		{name: "env trims and lowercases", env: " SpiderMonkey ", want: waaBackendSpiderMonkey},
+		{name: "flag overrides env", flag: "spidermonkey", env: "camoufox", want: waaBackendSpiderMonkey},
+		{name: "flag camoufox", flag: "camoufox", want: waaBackendCamoufox},
+		{name: "invalid flag", flag: "native", wantErr: true},
+		{name: "invalid flag overrides env", flag: "native", env: "camoufox", wantErr: true},
+		{name: "invalid env", env: "native", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("WAA_BACKEND", tt.env)
+			got, err := resolveWAABackend(tt.flag)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got backend %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveWAABackend failed: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("expected backend %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestResolvePrompt(t *testing.T) {
 	p, err := resolvePrompt("direct prompt", "")
 	if err != nil {

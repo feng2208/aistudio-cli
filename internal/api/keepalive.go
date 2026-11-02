@@ -1,17 +1,15 @@
 package api
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"sync"
 	"time"
 )
 
-// keepaliveWriter 在非流式响应写出前每隔心跳间隔写出一个换行，首个换行以 200 与 JSON 类型提交响应头，状态码只记入访问日志
+// keepaliveWriter 在非流式响应写出前每隔心跳间隔写出一个换行，首个换行以 200 与 JSON 类型提交响应头
 type keepaliveWriter struct {
 	http.ResponseWriter
-	ctx       context.Context
 	mu        sync.Mutex
 	timer     *time.Timer
 	committed bool
@@ -27,11 +25,11 @@ func (s *server) responseModes() ResponseModes {
 }
 
 // nonstreamKeepalive 在开启非流式保活时返回带保活的 ResponseWriter，以及在处理函数返回前调用的停止函数
-func (s *server) nonstreamKeepalive(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, func()) {
+func (s *server) nonstreamKeepalive(w http.ResponseWriter, _ *http.Request) (http.ResponseWriter, func()) {
 	if !s.responseModes().NonstreamKeepalive {
 		return w, func() {}
 	}
-	writer := &keepaliveWriter{ResponseWriter: w, ctx: r.Context()}
+	writer := &keepaliveWriter{ResponseWriter: w}
 	writer.timer = time.AfterFunc(streamHeartbeatInterval, writer.beat)
 	return writer, writer.stop
 }
@@ -71,23 +69,17 @@ func (writer *keepaliveWriter) Header() http.Header {
 	return writer.ResponseWriter.Header()
 }
 
-// WriteHeader 在响应头未提交时写出状态码，已提交时把状态码记入访问日志
+// WriteHeader 在响应头未提交时写出状态码，已提交时忽略
 func (writer *keepaliveWriter) WriteHeader(status int) {
 	writer.stop()
 	if !writer.committed {
 		writer.ResponseWriter.WriteHeader(status)
-		return
 	}
-	setAccessLogFailureStatus(writer.ctx, status)
 }
 
 func (writer *keepaliveWriter) Write(data []byte) (int, error) {
 	writer.stop()
 	return writer.ResponseWriter.Write(data)
-}
-
-func (writer *keepaliveWriter) setError(message string) {
-	setAccessLogResponseError(writer.ResponseWriter, message)
 }
 
 func (writer *keepaliveWriter) Unwrap() http.ResponseWriter {

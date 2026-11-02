@@ -21,7 +21,6 @@ type backgroundRun struct {
 
 // startBackground 登记后台响应并返回不随客户端连接关闭而取消的生成 context，返回的 finish 在生成结束后调用
 func (s *server) startBackground(r *http.Request, id string) (context.Context, func()) {
-	DetachAccessLog(r.Context())
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	run := backgroundRun{cancel: cancel, done: make(chan struct{})}
 	s.background.Store(id, run)
