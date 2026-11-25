@@ -59,22 +59,28 @@ func TestResolveWAABackend(t *testing.T) {
 		name    string
 		flag    string
 		env     string
+		path    string
 		want    string
 		wantErr bool
 	}{
-		{name: "default camoufox", want: waaBackendCamoufox},
+		{name: "default spidermonkey", want: waaBackendSpiderMonkey},
+		{name: "blank camoufox path keeps spidermonkey", path: "   ", want: waaBackendSpiderMonkey},
+		{name: "camoufox path selects camoufox", path: `C:\Camoufox\camoufox.exe`, want: waaBackendCamoufox},
 		{name: "env spidermonkey", env: "spidermonkey", want: waaBackendSpiderMonkey},
 		{name: "env trims and lowercases", env: " SpiderMonkey ", want: waaBackendSpiderMonkey},
+		{name: "env overrides camoufox path", env: "spidermonkey", path: `C:\Camoufox\camoufox.exe`, want: waaBackendSpiderMonkey},
 		{name: "flag overrides env", flag: "spidermonkey", env: "camoufox", want: waaBackendSpiderMonkey},
+		{name: "flag overrides camoufox path", flag: "spidermonkey", path: `C:\Camoufox\camoufox.exe`, want: waaBackendSpiderMonkey},
 		{name: "flag camoufox", flag: "camoufox", want: waaBackendCamoufox},
 		{name: "invalid flag", flag: "native", wantErr: true},
 		{name: "invalid flag overrides env", flag: "native", env: "camoufox", wantErr: true},
 		{name: "invalid env", env: "native", wantErr: true},
+		{name: "invalid env overrides camoufox path", env: "native", path: `C:\Camoufox\camoufox.exe`, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("WAA_BACKEND", tt.env)
-			got, err := resolveWAABackend(tt.flag)
+			got, err := resolveWAABackend(tt.flag, tt.path)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got backend %q", got)

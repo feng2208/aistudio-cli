@@ -37,8 +37,8 @@ func handleServeCommand(ctx context.Context, args []string) error {
 	fs.StringVar(&listen, "listen", "127.0.0.1:2048", "HTTP 监听地址")
 	fs.StringVar(&apiKey, "api-key", "", "可选 API key；设置后请求需携带 Authorization: Bearer <key>")
 	fs.StringVar(&globalProxy, "proxy", "", "全局 HTTP/SOCKS5 代理")
-	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (仅 camoufox 后端；不指定时自动定位或下载)")
-	fs.StringVar(&waaBackend, "waa-backend", "", "WAA 后端：camoufox 或 spidermonkey (默认 camoufox，也可用 WAA_BACKEND 环境变量)")
+	fs.StringVar(&camoufoxPath, "camoufox-path", "", "指定本地 Camoufox 可执行文件完整路径 (未显式选择后端时自动使用 camoufox)")
+	fs.StringVar(&waaBackend, "waa-backend", "", "WAA 后端：camoufox 或 spidermonkey (默认 spidermonkey，也可用 WAA_BACKEND 环境变量)")
 	fs.Var(&initTimeout, "init-timeout", "WAA 初始化超时 (默认 2m)")
 	fs.Var(&startupTimeout, "startup-timeout", "启动时同步模型目录超时 (默认 2m)")
 	fs.Var(&requestTimeout, "request-timeout", "单次公开 API 请求超时 (默认 30m，0 表示不限制)")
@@ -56,7 +56,7 @@ func handleServeCommand(ctx context.Context, args []string) error {
 		authDirs = []string{"auth"}
 	}
 
-	backend, err := resolveWAABackend(waaBackend)
+	backend, err := resolveWAABackend(waaBackend, camoufoxPath)
 	if err != nil {
 		return err
 	}

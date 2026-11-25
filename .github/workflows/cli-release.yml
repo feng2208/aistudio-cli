@@ -75,9 +75,47 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: ./.github/actions/spidermonkey
+        with:
+          target: linux-amd64-gnu
+      - name: Build CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_SHA:0:7}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          version="${version//\//-}"
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 \
+            go build -mod=readonly -trimpath -ldflags="-s -w" -o dist/aistudio-cli ./cmd/aistudio-cli
+          tar -czf "dist/aistudio-cli-${version}-linux-amd64.tar.gz" -C dist aistudio-cli
+          ls -lh dist
+      - name: Smoke Test
+        shell: bash
+        run: |
+          ./dist/aistudio-cli --help > /dev/null
+          ldd dist/aistudio-cli
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-linux-amd64
+          path: dist/aistudio-cli-*-linux-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [test, build-windows]
+    needs: [test, build-windows, build-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -85,6 +123,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: cli-windows-amd64
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-linux-amd64
           path: dist
       - name: Publish Release
         env:
